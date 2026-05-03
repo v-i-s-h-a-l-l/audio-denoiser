@@ -1,0 +1,32 @@
+# Runtime directories
+output/
+uploads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+dist/
+build/
+
+# Environment secrets
+.env
+.env.local
+*.env
+
+# Audio files (safety net)
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# OS
+.DS_Store
+Thumbs.db

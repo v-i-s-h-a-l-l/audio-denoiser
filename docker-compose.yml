@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    container_name: audio_backend
+    command: sh -c "cd /app/backend && uvicorn main:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+    ports:
+      - "8080:8000"        # 👈 8080 on host → 8000 inside container
+
+  frontend:
+    build: .
+    container_name: audio_frontend
+    command: python /app/frontend/app.py
+    ports:
+      - "7860:7860"
+    environment:
+      - BACKEND_URL=http://backend:8000   # 👈 always 8000 (internal Docker)
+    depends_on:
+      - backend
