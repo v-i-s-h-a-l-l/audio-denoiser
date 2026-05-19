@@ -31,7 +31,9 @@ RUN pip install \
     uvicorn \
     python-multipart \
     gradio \
-    requests
+    requests \
+    soxr \
+    numpy
 
 WORKDIR /app
 
