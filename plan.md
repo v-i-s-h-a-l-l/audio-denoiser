@@ -136,12 +136,12 @@ For clients that can send multiple files in one HTTP request, the new endpoint b
 
 ---
 
-## 5. Expected Latency Numbers (GPU, RTX 3090)
+## 5. Expected Latency Numbers (GPU, L4)
 
 | Scenario | Before | After |
 |---|---|---|
-| Mono, 5 s clip | ~400 ms | ~20–30 ms |
-| Stereo, 5 s clip | ~800 ms | ~20–30 ms |
+| Mono, 5 s clip | ~70-80 ms | ~15-20 ms |
+| Stereo, 5 s clip | ~80-100 ms | ~20 ms |
 | 8 concurrent requests (5 s each) | ~6400 ms total | ~60–80 ms (batched) |
 
 *Numbers are estimates based on DeepFilterNet3 benchmarks at 48 kHz. Actual values depend on GPU model and PCIe generation.*
@@ -151,5 +151,4 @@ For clients that can send multiple files in one HTTP request, the new endpoint b
 ## 6. Remaining Headroom (Future Work)
 
 - **TorchScript / `torch.compile()`**: Compiling the model once at startup (`torch.compile(_model)`) can cut per-chunk compute by 15–30% on PyTorch 2.x.
-- **INT8 / FP16 quantisation**: If a 0.1–0.3 dB quality trade-off is acceptable, quantisation cuts memory bandwidth and compute time roughly in half.
 - **Streaming HTTP response**: Stream denoised chunks back to the client as they complete rather than waiting for the full file — perceived first-byte latency drops to a single chunk's compute time (~15 ms).
