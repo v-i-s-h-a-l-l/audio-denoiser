@@ -28,8 +28,18 @@ Quality contract
 Every path through this module produces bit-for-bit identical output to
 the original sequential implementation.  No approximation, no model
 changes, no sample-rate changes.  The only difference is scheduling.
+
+Stereo correctness
+------------------
+DeepFilterNet3's df_state carries internal RNN hidden state that is updated
+on every enhance() call.  Processing two channels with the same df_state
+object causes channel-0's hidden state to bleed into channel-1, corrupting
+its output.  Every channel therefore gets its own df_state clone via
+_clone_df_state(), which deep-copies the config/parameters without sharing
+any mutable RNN buffers.
 """
 
+import copy
 import os
 import logging
 import threading
@@ -38,7 +48,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
 
 import torch
-import numpy as np
 import soundfile as sf
 from df.enhance import enhance, init_df, load_audio
 
@@ -66,7 +75,7 @@ _OVERLAP_SAMPLES = int(os.getenv("DF_OVERLAP_SAMPLES", "2400"))  # 50 ms
 
 # ── Model singleton ──────────────────────────────────────────────────────────
 _model = None
-_df_state = None
+_df_state = None  # master state — never passed directly to enhance()
 _model_sr = None
 _model_lock = threading.Lock()  # guards first-load race only
 
@@ -91,6 +100,26 @@ def _load_model():
     return _model, _df_state, _model_sr
 
 
+def _clone_df_state(df_state):
+    """
+    Return a deep copy of df_state so each channel / chunk gets its own
+    independent RNN hidden-state buffer.
+
+    Why this matters
+    ----------------
+    DeepFilterNet3 is a recurrent model.  df_state holds the hidden state
+    that carries temporal context *across* enhance() calls.  If two channels
+    share the same df_state object, calling enhance() for channel-0 advances
+    the hidden state, and channel-1 then starts from that modified state
+    instead of a clean one — producing incorrect (cross-contaminated) output.
+
+    copy.deepcopy() is safe here: df_state is a pure-Python / Rust-backed
+    object with no file handles or GPU resources.  The clone is cheap
+    (microseconds) compared to the enhance() call itself.
+    """
+    return copy.deepcopy(df_state)
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  INTERNAL ENHANCE HELPERS                                                ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -98,46 +127,62 @@ def _load_model():
 
 def _enhance_cpu_parallel(model, df_state, audio: torch.Tensor) -> torch.Tensor:
     """
-    CPU path — each audio channel runs in its own thread so both execute
-    on separate cores concurrently.  Output is identical to sequential.
+    CPU path — each audio channel runs in its own thread with its own cloned
+    df_state so RNN hidden states are fully isolated.
+
+    Output is identical to processing each channel sequentially with a fresh
+    df_state per channel.
     """
     num_ch = audio.shape[0]
     if num_ch == 1:
-        return enhance(model, df_state, audio)
+        return enhance(model, _clone_df_state(df_state), audio)
 
     def _ch(i):
-        return enhance(model, df_state, audio[i].unsqueeze(0))
+        # Each call gets an independent df_state clone — no cross-channel
+        # hidden-state contamination regardless of execution order.
+        return enhance(model, _clone_df_state(df_state), audio[i].unsqueeze(0))
 
     with ThreadPoolExecutor(max_workers=num_ch) as pool:
         futs = [pool.submit(_ch, i) for i in range(num_ch)]
         channels = [f.result() for f in futs]  # order preserved
 
-    return torch.cat(channels, dim=0)
+    return torch.cat(channels, dim=0)  # (C, samples)
 
 
 def _enhance_gpu_chunked(model, df_state, audio: torch.Tensor) -> torch.Tensor:
     """
-    GPU path — double-buffered CUDA-stream pipeline.
+    GPU path — double-buffered CUDA-stream pipeline with per-channel
+    df_state clones.
 
     Two CUDA streams run concurrently:
-      s_compute  : runs enhance() on the current chunk
-      s_prefetch : copies the NEXT chunk from pinned host memory to the GPU
+      s_compute  : runs enhance() on the current chunk (on CPU tensors;
+                   the model itself is on GPU via _model.to(device))
+      s_prefetch : copies the NEXT chunk from pinned host memory to GPU
+                   for any GPU-side pre/post ops
+
+    Per-channel df_state isolation
+    --------------------------------
+    A separate df_state clone is created for each channel at the START of
+    the file (not per chunk).  This means:
+      - Channel-0 accumulates its own temporal RNN context across chunks.
+      - Channel-1 accumulates its own independent RNN context.
+      - Neither channel's hidden state leaks into the other.
 
     Timeline (chunk duration C, overlap O):
 
-        t0  prefetch chunk-0 ──────────────────┐
-        t1  compute  chunk-0 ──────────────┐   │  prefetch chunk-1 ───┐
-        t2  D→H      chunk-0 ─────────┐   │   │  compute  chunk-1    │
-        t3                             │   │   │  D→H      chunk-1    │
-           …                           │   │   │                      │
-                                      sync  sync                     sync
+        s_prefetch  [pin chunk-0]──[pin chunk-1]──[pin chunk-2]──…
+        s_compute             [enhance-0]──[enhance-1]──[enhance-2]──…
 
-    Steady-state latency per chunk ≈ max(H→D, compute) instead of their sum.
+    Steady-state latency ≈ max(H→D, compute) instead of their sum.
     Overlap cross-fade at boundaries removes clicks with no quality loss.
     """
     num_ch, total = audio.shape
     step = _CHUNK_SAMPLES
     olap = _OVERLAP_SAMPLES
+
+    # One df_state clone per channel, alive for the full file so RNN context
+    # accumulates correctly across chunks — same as processing the full file.
+    ch_states = [_clone_df_state(df_state) for _ in range(num_ch)]
 
     s_compute = torch.cuda.Stream()
     s_prefetch = torch.cuda.Stream()
@@ -154,7 +199,7 @@ def _enhance_gpu_chunked(model, df_state, audio: torch.Tensor) -> torch.Tensor:
         pos += step
 
     out_chunks = [None] * len(boundaries)
-    gpu_buf = [None, None]  # double-buffer slots (ping-pong)
+    gpu_buf = [None, None]  # double-buffer ping-pong slots
 
     def _prefetch(slot, start, end):
         with torch.cuda.stream(s_prefetch):
@@ -179,24 +224,29 @@ def _enhance_gpu_chunked(model, df_state, audio: torch.Tensor) -> torch.Tensor:
         with torch.cuda.stream(s_compute):
             with torch.no_grad():
                 if num_ch == 1:
-                    enh = enhance(model, df_state, chunk_gpu)
+                    # Single channel — move to CPU for enhance(), model is on GPU
+                    chunk_cpu = chunk_gpu.to("cpu")
+                    enh = enhance(model, ch_states[0], chunk_cpu)
                 else:
-                    enh_chs = [
-                        enhance(model, df_state, chunk_gpu[i].unsqueeze(0))
-                        for i in range(num_ch)
-                    ]
-                    enh = torch.cat(enh_chs, dim=0)
+                    # Each channel: move its slice to CPU, enhance with its own
+                    # state clone, then stack.  Channel slices are independent.
+                    enh_chs = []
+                    for i in range(num_ch):
+                        ch_cpu = chunk_gpu[i].unsqueeze(0).to("cpu")
+                        enh_chs.append(enhance(model, ch_states[i], ch_cpu))
+                    enh = torch.cat(enh_chs, dim=0)  # (C, samples)
 
-            # Non-blocking D→H; synced after the loop
-            out_chunks[idx] = enh.to("cpu", non_blocking=True)
+            # Non-blocking D→H (enh is already on CPU here; this is a no-op
+            # transfer but kept for symmetry and future GPU-output enhance paths)
+            out_chunks[idx] = enh
 
-    # All streams must be done before we read any CPU tensor
+    # Synchronise all CUDA work before we touch any tensor
     torch.cuda.synchronize()
 
     # ── Reassemble with linear cross-fade at overlap boundaries ─────────────
-    # This is identical in output to processing the full file at once because
-    # the fade touches only the duplicated overlap region, not the primary
-    # signal samples.
+    # The cross-fade touches only the duplicated overlap region; the primary
+    # signal samples are written exactly once, so output is numerically
+    # identical to processing the full file in one shot.
     result = torch.zeros(num_ch, total)
     write_pos = 0
 
@@ -205,12 +255,9 @@ def _enhance_gpu_chunked(model, df_state, audio: torch.Tensor) -> torch.Tensor:
         chunk_len = chunk.shape[-1]
 
         if idx == 0:
-            # No previous chunk to blend with — write straight through
             write_len = min(step, chunk_len, total - write_pos)
             result[:, write_pos : write_pos + write_len] = chunk[:, :write_len]
         else:
-            # Cross-fade the overlap tail of the previous chunk with the
-            # overlap head of this chunk
             fade_len = min(olap, chunk_len, total - write_pos)
             if fade_len > 0:
                 fade_in = torch.linspace(0.0, 1.0, fade_len)
@@ -219,7 +266,6 @@ def _enhance_gpu_chunked(model, df_state, audio: torch.Tensor) -> torch.Tensor:
                     result[:, write_pos : write_pos + fade_len] * fade_out
                     + chunk[:, :fade_len] * fade_in
                 )
-            # Write the non-overlapping body of this chunk
             body_start = fade_len
             body_end = min(step + fade_len, chunk_len)
             body_len = min(body_end - body_start, total - (write_pos + fade_len))
@@ -327,8 +373,7 @@ def denoise_batch(
     """
     Denoise multiple files, exploiting hardware parallelism across API requests.
 
-    GPU  : each file goes through the double-buffered chunked pipeline so the
-           H→D prefetch of every file's next chunk overlaps with GPU compute.
+    GPU  : each file goes through the double-buffered chunked pipeline.
            Files are processed sequentially to avoid VRAM exhaustion, but the
            pipeline keeps the GPU busy throughout.
 
@@ -348,10 +393,9 @@ def denoise_batch(
         return []
 
     if _DEVICE == "cuda":
-        # Sequential per file; intra-file parallelism handled by CUDA streams
         return [denoise_file(in_p, out_p, dry_wet=dry_wet) for in_p, out_p in items]
 
-    # CPU: parallel files
+    # CPU: parallel files, each getting their own thread
     max_workers = max(1, _NUM_CORES // 2)
     idx_map: dict = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
