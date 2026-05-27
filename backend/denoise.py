@@ -27,7 +27,8 @@ Quality contract
 ----------------
 Every path through this module produces bit-for-bit identical output to
 the original sequential implementation. No approximation, no model
-changes, no sample-rate changes. The only difference is scheduling.
+changes, no sample-rate changes during model inference.
+Only the FINAL exported WAV is downsampled to 16 kHz.
 
 Stereo correctness
 ------------------
@@ -49,6 +50,8 @@ from typing import Sequence
 
 import torch
 import soundfile as sf
+import torchaudio.functional as AF
+
 from df.enhance import enhance, init_df, load_audio
 
 logger = logging.getLogger(__name__)
@@ -74,14 +77,15 @@ if _DEVICE == "cpu":
     )
 
 # ── Chunking parameters (GPU pipeline only) ─────────────────────────────────
-# 48 000 Hz × 0.5 s = 24 000 samples → ~10–15 ms GPU compute at real-time.
-# Overlap prevents audible boundary artefacts.
-_CHUNK_SAMPLES = int(os.getenv("DF_CHUNK_SAMPLES", "24000"))  # 0.5 s @ 48k
-_OVERLAP_SAMPLES = int(os.getenv("DF_OVERLAP_SAMPLES", "2400"))  # 50 ms
+_CHUNK_SAMPLES = int(os.getenv("DF_CHUNK_SAMPLES", "24000"))
+_OVERLAP_SAMPLES = int(os.getenv("DF_OVERLAP_SAMPLES", "2400"))
+
+# ── Output sample rate ──────────────────────────────────────────────────────
+_OUTPUT_SR = 16000
 
 # ── Model singleton ─────────────────────────────────────────────────────────
 _model = None
-_df_state = None  # master state — never passed directly to enhance()
+_df_state = None
 _model_sr = None
 _model_lock = threading.Lock()
 
@@ -117,30 +121,8 @@ def _clone_df_state(df_state):
     """
     DeepFilterNet3's df_state is a Rust-backed PyO3 object (builtins.DF)
     which cannot be safely deepcopy()'d or pickled.
-
-    The correct way to obtain an independent DF state is to call
-    init_df() again and discard the returned model.
-
-    Why this is safe and efficient
-    ------------------------------
-    - We KEEP using the already-loaded singleton _model everywhere.
-    - We only need a fresh df_state object containing:
-          * clean RNN hidden state
-          * config/runtime buffers
-    - init_df("DeepFilterNet3") is cheap after the first load because
-      model files/configs are cached internally.
-
-    This guarantees:
-    ----------------
-    ✓ No cross-channel hidden-state contamination
-    ✓ No shared mutable RNN buffers
-    ✓ Correct stereo behaviour
-    ✓ Correct chunked streaming behaviour
-    ✓ No deepcopy() crashes with PyO3 DF objects
     """
 
-    # We intentionally discard the newly returned model and keep using
-    # the global singleton _model already loaded by _load_model().
     _, fresh_state, _ = init_df("DeepFilterNet3")
 
     return fresh_state
@@ -156,13 +138,6 @@ def _enhance_cpu_parallel(
     df_state,
     audio: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    CPU path — each audio channel runs in its own thread with its own
-    independent df_state.
-
-    Output is identical to processing each channel sequentially with a
-    fresh df_state per channel.
-    """
 
     num_ch = audio.shape[0]
 
@@ -188,17 +163,12 @@ def _enhance_gpu_chunked(
     df_state,
     audio: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    GPU path — double-buffered CUDA-stream pipeline with per-channel
-    df_state isolation.
-    """
 
     num_ch, total = audio.shape
 
     step = _CHUNK_SAMPLES
     olap = _OVERLAP_SAMPLES
 
-    # One persistent state per channel across all chunks.
     ch_states = [_clone_df_state(df_state) for _ in range(num_ch)]
 
     s_compute = torch.cuda.Stream()
@@ -268,8 +238,6 @@ def _enhance_gpu_chunked(
 
     torch.cuda.synchronize()
 
-    # ── Reassemble with overlap crossfade ──────────────────────────────────
-
     result = torch.zeros(num_ch, total)
 
     write_pos = 0
@@ -319,6 +287,37 @@ def _enhance_gpu_chunked(
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  RESAMPLING HELPER                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+
+def _downsample_to_16k(audio_np, orig_sr):
+    """
+    Downsample final output to 16 kHz AFTER model inference.
+    Model pipeline remains completely unchanged internally.
+    """
+
+    if orig_sr == _OUTPUT_SR:
+        return audio_np
+
+    audio_tensor = torch.from_numpy(audio_np)
+
+    # Convert to [channels, samples]
+    if audio_tensor.ndim == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)
+    else:
+        audio_tensor = audio_tensor.T
+
+    audio_tensor = AF.resample(
+        audio_tensor,
+        orig_freq=orig_sr,
+        new_freq=_OUTPUT_SR,
+    )
+
+    return audio_tensor.T.numpy()
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  PUBLIC API                                                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -329,6 +328,7 @@ def denoise_file(
     *,
     dry_wet: float = 1.0,
 ) -> str:
+
     if not 0.0 <= dry_wet <= 1.0:
         raise ValueError(f"dry_wet must be in [0.0, 1.0], got {dry_wet}")
 
@@ -381,7 +381,8 @@ def denoise_file(
         min_len = min(audio.shape[-1], enhanced.shape[-1])
 
         enhanced = (
-            dry_wet * enhanced[..., :min_len] + (1.0 - dry_wet) * audio[..., :min_len]
+            dry_wet * enhanced[..., :min_len]
+            + (1.0 - dry_wet) * audio[..., :min_len]
         )
 
         logger.info(
@@ -390,7 +391,7 @@ def denoise_file(
             (1.0 - dry_wet) * 100,
         )
 
-    # ── Write ──────────────────────────────────────────────────────────────
+    # ── Convert to numpy ──────────────────────────────────────────────────
 
     audio_np = enhanced.numpy()
 
@@ -399,19 +400,28 @@ def denoise_file(
     else:
         audio_np = audio_np.squeeze()
 
+    # ── FINAL DOWNSAMPLING ONLY ───────────────────────────────────────────
+
+    audio_np = _downsample_to_16k(
+        audio_np,
+        model_sr,
+    )
+
+    # ── Write ──────────────────────────────────────────────────────────────
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     sf.write(
         str(output_path),
         audio_np,
-        model_sr,
+        _OUTPUT_SR,
         subtype="PCM_24",
     )
 
     logger.info(
         "Saved: %s  (sr=%d Hz, PCM_24, ch=%d)",
         output_path,
-        model_sr,
+        _OUTPUT_SR,
         num_channels,
     )
 
@@ -423,13 +433,13 @@ def denoise_batch(
     *,
     dry_wet: float = 1.0,
 ) -> list[str]:
+
     if not items:
         return []
 
     if _DEVICE == "cuda":
         return [denoise_file(in_p, out_p, dry_wet=dry_wet) for in_p, out_p in items]
 
-    # CPU path: parallel files
     max_workers = max(1, _NUM_CORES // 2)
 
     idx_map = {}
@@ -461,7 +471,7 @@ def denoise_bytes(
 ) -> bytes:
     """
     In-memory convenience wrapper.
-    Accepts raw audio bytes, returns denoised WAV bytes at 48 kHz PCM_24.
+    Returns denoised WAV bytes at 16 kHz PCM_24.
     """
 
     import tempfile
@@ -495,4 +505,3 @@ def denoise_bytes(
                 os.remove(p)
             except OSError:
                 pass
-
